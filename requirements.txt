@@ -3,3 +3,6 @@ uvicorn
 pydub
 ffmpeg-python
 python-multipart
+demucs
+torchaudio
+torch
