@@ -1,6 +1,3 @@
-# app.py
-# FastAPI backend for Mixy-style audio mashup
-
 import os
 import uuid
 import subprocess
@@ -28,38 +25,31 @@ async def download_audio_from_url(url: str, output_path: str):
     ]
     subprocess.run(cmd, check=True)
 
-# Utility to separate stems using Demucs (vocal + instrumental)
-def separate_stems(input_path: str, out_dir: str):
-    # demucs will create a subfolder under out_dir
+# Utility to separate stems using Demucs (v4)
+def separate_stems(input_path: str, out_dir: str) -> str:
     cmd = ["demucs", "-d", "cpu", "-o", out_dir, input_path]
     subprocess.run(cmd, check=True)
-    # Flatten stems from demucs output
-    stems_folder = os.path.join(out_dir, os.listdir(out_dir)[0])
-    return stems_folder
+    # Demucs creates a subfolder under out_dir
+    folder = os.listdir(out_dir)[0]
+    return os.path.join(out_dir, folder)
 
-# Utility to detect BPM (tempo) using librosa
+# Utility to detect BPM (tempo)
 def detect_bpm(audio_path: str) -> float:
     y, sr = librosa.load(audio_path, sr=None)
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     return float(tempo)
 
-# Utility to adjust speed (tempo) and pitch using ffmpeg
-# pitch in semitones, speed multiplier
-async def adjust_speed_and_pitch(
-    input_path: str, output_path: str, speed: float = 1.0, pitch_semitones: float = 0.0
-):
-    # Build ffmpeg filter chain: asetrate for speed, rubberband for pitch
-    # Requires ffmpeg compiled with rubberband
-    filter_chain = []
+# Utility to adjust speed and pitch using ffmpeg and rubberband
+def adjust_speed_and_pitch(input_path: str, output_path: str, speed: float = 1.0, pitch_semitones: float = 0.0):
+    filters = []
     if speed != 1.0:
-        filter_chain.append(f"atempo={speed}")
+        filters.append(f"atempo={speed}")
     if pitch_semitones != 0.0:
-        filter_chain.append(f"rubberband=pitch={pitch_semitones}")
-    filter_str = ",".join(filter_chain)
+        filters.append(f"rubberband=pitch={pitch_semitones}")
     cmd = ["ffmpeg", "-y", "-i", input_path]
-    if filter_chain:
-        cmd += ["-af", filter_str]
-    cmd += [output_path]
+    if filters:
+        cmd += ["-af", ",".join(filters)]
+    cmd.append(output_path)
     subprocess.run(cmd, check=True)
 
 @app.post("/mashup")
@@ -76,74 +66,67 @@ async def mashup(
     section2_start: float = Form(0.0),
     section2_duration: float = Form(None),
 ):
-    """
-    Endpoint to upload two audio inputs (files or URLs), separate stems,
-    adjust pitch/speed, mix vocals of one with instrumental of the other,
-    and return a downloadable MP3.
-    """
+    """Combine two inputs, separate stems, adjust settings, and return an MP3 mashup"""
     job_id = str(uuid.uuid4())
-    base_dir = os.path.join(OUTPUT_DIR, job_id)
-    os.makedirs(base_dir, exist_ok=True)
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
-    # Save or download input files
-    paths = []
+    inputs = []
     for idx, (f, url) in enumerate(((file1, url1), (file2, url2)), start=1):
         if url:
-            out_path = os.path.join(base_dir, f"input{idx}.wav")
-            await download_audio_from_url(url, out_path)
+            path = os.path.join(job_dir, f"input{idx}.wav")
+            await download_audio_from_url(url, path)
         elif f:
             ext = os.path.splitext(f.filename)[1]
-            out_path = os.path.join(base_dir, f"input{idx}{ext}")
-            with open(out_path, "wb") as buf:
+            path = os.path.join(job_dir, f"input{idx}{ext}")
+            with open(path, "wb") as buf:
                 buf.write(await f.read())
         else:
             raise HTTPException(status_code=400, detail=f"Provide file{idx} or url{idx}")
-        paths.append(out_path)
+        inputs.append(path)
 
-    # Separate stems
-    stems1 = separate_stems(paths[0], os.path.join(base_dir, "stems1"))
-    stems2 = separate_stems(paths[1], os.path.join(base_dir, "stems2"))
+    stems1 = separate_stems(inputs[0], os.path.join(job_dir, "stems1"))
+    stems2 = separate_stems(inputs[1], os.path.join(job_dir, "stems2"))
 
-    # Paths to vocal and instrumental stems
     vocal1 = os.path.join(stems1, "vocals.wav")
-    inst1 = os.path.join(stems1, "no_vocals.wav")
-    vocal2 = os.path.join(stems2, "vocals.wav")
     inst2 = os.path.join(stems2, "no_vocals.wav")
 
-    # Crop selected sections
-    def crop(input_path, start, dur, out_path):
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-ss", str(start)]
-        if dur:
-            cmd += ["-t", str(dur)]
-        cmd += [out_path]
-        subprocess.run(cmd, check=True)
+    # Crop sections
+def crop(input_path, start, duration, out_path):
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-ss", str(start)]
+    if duration:
+        cmd += ["-t", str(duration)]
+    cmd.append(out_path)
+    subprocess.run(cmd, check=True)
 
-    crop(os.path.join(stems1, "vocals.wav"), section1_start, section1_duration, os.path.join(base_dir, "voc1_cut.wav"))
-    crop(os.path.join(stems2, "no_vocals.wav"), section2_start, section2_duration, os.path.join(base_dir, "inst2_cut.wav"))
+    voc_cut = os.path.join(job_dir, "voc_cut.wav")
+    inst_cut = os.path.join(job_dir, "inst_cut.wav")
+    crop(vocal1, section1_start, section1_duration, voc_cut)
+    crop(inst2, section2_start, section2_duration, inst_cut)
 
-    # Adjust speed & pitch on both cropped stems
-    await adjust_speed_and_pitch(os.path.join(base_dir, "voc1_cut.wav"), os.path.join(base_dir, "voc1_final.wav"), speed, pitch)
-    await adjust_speed_and_pitch(os.path.join(base_dir, "inst2_cut.wav"), os.path.join(base_dir, "inst2_final.wav"), speed, pitch)
+    # Adjust speed & pitch
+    voc_final = os.path.join(job_dir, "voc_final.wav")
+    inst_final = os.path.join(job_dir, "inst_final.wav")
+    adjust_speed_and_pitch(voc_cut, voc_final, speed, pitch)
+    adjust_speed_and_pitch(inst_cut, inst_final, speed, pitch)
 
-    # Mix adjusted stems together
-    final_path = os.path.join(base_dir, f"{job_id}.mp3")
-    cmd_mix = [
+    # Mix with volume control
+    output_mp3 = os.path.join(job_dir, f"{job_id}.mp3")
+    mix_cmd = [
         "ffmpeg", "-y",
-        "-i", os.path.join(base_dir, "voc1_final.wav"),
-        "-i", os.path.join(base_dir, "inst2_final.wav"),
+        "-i", voc_final,
+        "-i", inst_final,
         "-filter_complex",
         f"[0:a]volume={mix_volume}[a];[1:a]volume={1-mix_volume}[b];[a][b]amix=inputs=2:duration=first",
-        "-c:a", "libmp3lame",
-        final_path
+        output_mp3
     ]
-    subprocess.run(cmd_mix, check=True)
+    subprocess.run(mix_cmd, check=True)
 
     return {"download_url": f"/download/{job_id}/{job_id}.mp3"}
 
 @app.get("/download/{job_id}/{filename}")
 async def download_file(job_id: str, filename: str):
-    file_path = os.path.join(OUTPUT_DIR, job_id, filename)
-    if not os.path.isfile(file_path):
+    path = os.path.join(OUTPUT_DIR, job_id, filename)
+    if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path, media_type="audio/mpeg", filename=filename)
-```
+    return FileResponse(path, media_type="audio/mpeg", filename=filename)
